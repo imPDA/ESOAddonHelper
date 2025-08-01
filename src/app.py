@@ -1,10 +1,10 @@
-import pathlib
+from functools import partial
 import sys
 from typing import Literal
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, 
                               QVBoxLayout, QLabel, QStackedWidget,
                               QPushButton, QFrame, QButtonGroup, 
-                              QScrollArea, QHBoxLayout, QListWidget)
+                              QScrollArea, QHBoxLayout, QLineEdit)
 from PySide6.QtCore import Qt, QTimer, QObject, Signal, QThread, Slot
 from PySide6.QtGui import QPixmap
 
@@ -16,41 +16,140 @@ COLOR_3 = '2d2d43'  # Hover color
 COLOR_4 = '31262e'  # Main background
 
 
-class InstalledAddonsWorker(QObject):
-    finished = Signal()
+class AddonRepository:
+    def __init__(self):
+        self.addons = extract_all_addons_data(get_addons_folder_windows('live'))
+
+    def get_addons(self):
+        for addon in self.addons:
+            yield addon
+
+
+addon_repository = AddonRepository()
+
+
+class AddonWorker(QObject):
     progress = Signal(dict)
+    finished = Signal()
+    error = Signal(str)
+
+    def __init__(self, filters):
+        super().__init__()
+        self.filters = filters
 
     def run(self):
-        addons = extract_all_addons_data(get_addons_folder_windows('live'))
-        
-        for addon in addons:
-            if not addon['ok']:
-                continue
-           
-            self.progress.emit(addon)
+        try:
+            for addon in addon_repository.addons:
+                for filter_ in self.filters:
+                    if not filter_(addon):
+                        break
+                else:
+                    self.progress.emit(addon)
 
-        self.finished.emit()
+            self.finished.emit()
+        except Exception as e:
+            self.error.emit(str(e))
 
 
-class ErrorAddonsWorker(QObject):
-    finished = Signal()
-    progress = Signal(dict)
+class AddonTab(QWidget):
+    refresh_started = Signal()
+    refresh_completed = Signal()
 
-    def run(self):
-        addons = extract_all_addons_data(get_addons_folder_windows('live'))
-        
-        for addon in addons:
-            if addon['ok']:
-                continue
-           
-            self.progress.emit(addon)
+    def __init__(self, filters):
+        super().__init__()
 
-        self.finished.emit()
+        self.filters = filters
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        self.addon_scroll = AddonScroll()
+        layout.addWidget(self.addon_scroll)
+        self.list_layout = self.addon_scroll.get_layout()
+
+        self.dirty = True
+        self.ready = False
+        self.updating = False
+        self.current_thread = None
+        self.current_worker = None
+
+        self.is_loaded = False
+
+    @Slot(dict)
+    def handle_addon_progress(self, addon_data: dict):
+        self.addon_scroll.add_addon(addon_data)
+        # self.list_layout.addWidget(AddonRow(addon_data))
+
+    @Slot()
+    def handle_refresh_finished(self):
+        self.list_layout.addStretch()  # TODO: do I need it?
+
+        self.dirty = False
+        self.ready = True
+        self.updating = False
+        # self.current_thread = None
+        # self.current_worker = None
+
+        self.is_loaded = True
+        self.addon_scroll.visible_count_changed.emit(self.addon_scroll.visible_count)
+
+        self.refresh_completed.emit()
+
+    @Slot(str)
+    def handle_error(self, error_msg):
+        print(f"Error loading addons: {error_msg}")
+        self.handle_refresh_finished()
+
+    def clear_addons(self):
+        while self.list_layout.count():
+            item = self.list_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+    def refresh(self):
+        self.is_loaded = False
+        self.refresh_started.emit()
+
+        if self.updating:
+            return
+
+        self.clear_addons()
+
+        self.updating = True
+        self.ready = False
+
+        thread = QThread()
+        worker = AddonWorker(self.filters)
+
+        worker.moveToThread(thread)
+
+        thread.started.connect(worker.run)
+        thread.finished.connect(thread.deleteLater)
+
+        worker.progress.connect(self.handle_addon_progress)
+        worker.error.connect(self.handle_error)
+        worker.finished.connect(self.handle_refresh_finished)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+
+        self.current_thread = thread
+        self.current_worker = worker
+
+        thread.start()
+
+    def cancel_refresh(self):
+        if self.current_thread and self.current_thread.isRunning():
+            self.current_thread.quit()
+            self.current_thread.wait()
+            self.handle_refresh_finished()
 
 
 class AddonRow(QFrame):
     def __init__(self, addon):
         super().__init__()
+
+        self.addon = addon
 
         self.setFixedHeight(72)
         self.setStyleSheet(f"""
@@ -76,7 +175,7 @@ class AddonRow(QFrame):
         item_layout.setSpacing(15)
         
         icon = QLabel()
-        icon.setPixmap(QPixmap('nothing.png').scaled(48, 48, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        # icon.setPixmap(QPixmap('nothing.png').scaled(48, 48, Qt.KeepAspectRatio, Qt.SmoothTransformation))
         icon.setAlignment(Qt.AlignCenter)
         icon.setFixedSize(48, 48)
         item_layout.addWidget(icon)
@@ -106,6 +205,8 @@ class AddonRow(QFrame):
 
 
 class AddonScroll(QScrollArea):
+    visible_count_changed = Signal(int)
+
     def __init__(self):
         super().__init__()
         self.setWidgetResizable(True)
@@ -116,7 +217,7 @@ class AddonScroll(QScrollArea):
                 background: transparent;
             }}
             QScrollBar:vertical {{
-                background: #{COLOR_1};
+                background: #{COLOR_4};
                 width: 10px;
                 margin: 0px;
             }}
@@ -143,10 +244,56 @@ class AddonScroll(QScrollArea):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        self.layout = layout
+        self.visible_count = 0
+
+        self.addons_container = QWidget()
+        self.addons_layout = QVBoxLayout(self.addons_container)
+        self.addons_layout.setContentsMargins(0, 0, 0, 0)
+        self.addons_layout.setSpacing(0)
+
+        layout.addWidget(self.addons_container)
+
+        # self.layout = layout
+
+    def add_addon(self, addon_data: dict):
+        # TODO: add filtering here
+        self.addons_layout.addWidget(AddonRow(addon_data))
+        self.visible_count += 1
+
+    def filter_addons(self, search_string: str):
+        self.visible_count = 0
+
+        for i in range(self.addons_layout.count()):
+            item = self.addons_layout.itemAt(i)
+            widget = item.widget()
+
+            if not widget or not isinstance(widget, AddonRow):
+                continue
+
+            title = widget.addon.get("title", "").lower()
+            author = widget.addon.get("author", "").lower()
+            path = widget.addon.get("relative_path", "").lower().replace('\\', '/')
+            bundled = widget.addon.get('bundled', False)
+
+            isVisible = lambda x: (
+                x in title
+                or (x.startswith('@') and x[1:] in author)
+                or (x.startswith('/') and bundled and x in path)
+            )
+
+            filters = search_string.split()
+            visible = all([isVisible(f) for f in filters if not f.startswith('~')]) and all([not isVisible(f[1:]) for f in filters if f.startswith('~')])
+
+            widget.setVisible(visible)
+
+            if visible:
+                self.visible_count += 1
+            
+        self.visible_count_changed.emit(self.visible_count)
 
     def get_layout(self):
-        return self.layout
+        return self.addons_layout
+        # return self.layout
 
 
 class Main(QMainWindow):
@@ -156,13 +303,70 @@ class Main(QMainWindow):
         # self.setWindowFlag(Qt.FramelessWindowHint)
         # self.setAttribute(Qt.WA_TranslucentBackground)
 
-        self.setup_ui()
-        self.setup_tabs()
-        self.setup_connections()
+        self.tabs = [
+            {'name': 'Addons', 'tab': partial(AddonTab, [lambda x: x.get('ok'), lambda x: not x.get('isLibrary')])},
+            {'name': 'Libraries', 'tab': partial(AddonTab, [lambda x: x.get('ok'), lambda x: x.get('isLibrary')])},
+            {'name': 'Errors', 'tab': partial(AddonTab, [lambda x: not x.get('ok')])},
+        ]
+        self.current_loading_index = -1
 
-        self.add_installed_addons()
-        self.add_errors()
+        self.__tabs = []
+        self.__buttons = []
+
+        self.setup_ui()
+        self.setup_sidebar()
+        self.setup_content_area()
+
+        for i, tab in enumerate(self.__tabs):
+            # tab.refresh_started.connect(lambda idx=i: self.show_loading(idx))
+            tab.refresh_completed.connect(partial(self.show_tab_content, i))
+
+        for tab in self.__tabs:
+            tab.refresh()
+
+        self.switch_tab(0)
+    
+    def filter_all_tabs(self):
+        search_text = self.search_line.text().lower()
+        for tab in self.__tabs:
+            # if hasattr(tab, 'addon_scroll'):
+            tab.addon_scroll.filter_addons(search_text)
+
+    def setup_search_bar(self):
+        self.search_line = QLineEdit()
+        self.search_line.setPlaceholderText("Search addons...")
+        self.search_line.setStyleSheet(f"""
+            QLineEdit {{
+                background: #{COLOR_1};
+                border: 2px solid #{COLOR_1};
+                color: white;
+                padding: 8px;
+                margin: 10px;
+                border-radius: 4px;
+                height: 24px;
+            }}
+
+            QLineEdit:focus {{
+                border: 2px solid #{COLOR_2};
+            }}
+        """)
+        self.search_line.textChanged.connect(self.filter_all_tabs)
         
+        search_container = QWidget()
+        search_layout = QVBoxLayout(search_container)
+        search_layout.setContentsMargins(0, 0, 0, 0)
+        search_layout.addWidget(self.search_line)
+        
+        self.content_layout.addWidget(search_container)
+
+    def show_loading(self, tab_index):
+        self.current_loading_index = tab_index
+        self.stacked_widget.setCurrentWidget(self.loading_screen)
+    
+    def show_tab_content(self, tab_index):
+        if tab_index == self.current_loading_index:
+            self.stacked_widget.setCurrentWidget(self.__tabs[tab_index])
+
     def setup_ui(self):
         self.setWindowTitle('ESO Addon Helper')
         self.setMinimumSize(800, 400)
@@ -174,9 +378,6 @@ class Main(QMainWindow):
         self.main_layout = QHBoxLayout(central_widget)
         self.main_layout.setContentsMargins(0, 0, 0, 0)
         self.main_layout.setSpacing(0)
-        
-        self.setup_sidebar()
-        self.setup_content_area()
         
     def setup_sidebar(self):
         self.sidebar = QFrame()
@@ -190,11 +391,6 @@ class Main(QMainWindow):
 
         self.button_group = QButtonGroup()
         self.button_group.setExclusive(True)
-        
-        self.btn_installed = QPushButton("Addons")
-        self.btn_errors = QPushButton("Errors")
-        self.btn_search = QPushButton("Search")
-        self.btn_options = QPushButton("Options")
         
         button_style = f"""
             QPushButton {{
@@ -217,12 +413,18 @@ class Main(QMainWindow):
             }}
         """
 
-        for btn in [self.btn_installed, self.btn_errors, self.btn_options]:  # self.btn_search, 
-            btn.setCheckable(True)
-            btn.setStyleSheet(button_style)
-            btn.setCursor(Qt.PointingHandCursor)
-            self.button_group.addButton(btn)
-            self.sidebar_layout.addWidget(btn)
+        for i, tab in enumerate(self.tabs):
+            button = QPushButton(tab['name'])
+            button.setCheckable(True)
+            button.setStyleSheet(button_style)
+            button.setCursor(Qt.PointingHandCursor)
+
+            self.button_group.addButton(button)
+            self.sidebar_layout.addWidget(button)
+
+            button.clicked.connect(partial(self.switch_tab, i))
+
+            self.__buttons.append(button)
 
         self.sidebar_layout.addStretch()
 
@@ -240,104 +442,47 @@ class Main(QMainWindow):
         self.main_layout.addWidget(self.sidebar)
         
     def setup_content_area(self):
+        self.content = QWidget()
+        self.content_layout = QVBoxLayout(self.content)
+        self.content_layout.setContentsMargins(0, 0, 0, 0)
+        self.content_layout.setSpacing(0)
+
+        self.main_layout.addWidget(self.content)
+
+        self.setup_search_bar()
+
         self.stacked_widget = QStackedWidget()
-        self.main_layout.addWidget(self.stacked_widget)
+        self.content_layout.addWidget(self.stacked_widget)
 
-        self.loading_screen = QLabel('Loading...')
+        for i, tab in enumerate(self.tabs):
+            tab_widget = tab['tab']()
+            self.stacked_widget.addWidget(tab_widget)
+            self.__tabs.append(tab_widget)
+
+            tab_widget.addon_scroll.visible_count_changed.connect(lambda count, idx=i: self.update_tab_count(idx, count))
+
+        self.loading_screen = QLabel("Loading...")
+        self.loading_screen.setStyleSheet("""
+            QLabel {
+                color: #""" + COLOR_2 + """;
+                font-size: 24px;
+                font-weight: bold;
+                qproperty-alignment: AlignCenter;
+            }
+        """)
         self.stacked_widget.addWidget(self.loading_screen)
-        
-    def setup_tabs(self):
-        self.setup_installed_tab()
-        self.setup_errors_tab()
-        self.setup_search_tab()
-        self.setup_options_tab()
-
-    def add_installed_addons(self):
-        # TODO: refresh, delete addons
-        
-        # self.start_button.setEnabled(False)
-        # self.status_label.setText("Task running...")
-
-        thread = QThread()
-        worker = InstalledAddonsWorker()
-
-        self.installed_addons_thred = thread
-        self.installed_addons_worker = worker
-
-        worker.moveToThread(thread)
-
-        thread.started.connect(worker.run)
-        worker.finished.connect(self.installed_addons_added)
-        worker.progress.connect(self.add_installed_addon)
-        worker.finished.connect(thread.quit)
-        worker.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
-
-        thread.start()
     
-    @Slot(dict)
-    def add_installed_addon(self, addon_data):
-        self.addons_layout.addWidget(AddonRow(addon_data))
-    
-    def installed_addons_added(self):
-        # self.status_label.setText("Task completed!")
-        # self.start_button.setEnabled(True)
-        self.installed_addons_ready = True
-        self.switch_tab(1)
-        self.addons_layout.addStretch()
-    
-    def add_errors(self):
-        # TODO: refresh, delete addons
-        
-        # self.start_button.setEnabled(False)
-        # self.status_label.setText("Task running...")
+    def update_tab_count(self, tab_index, count):
+        text = self.tabs[tab_index]['name']
+        self.__buttons[tab_index].setText(f"{text} ({count})")
 
-        thread = QThread()
-        worker = ErrorAddonsWorker()
-
-        self.errors_thread = thread
-        self.errors_worker = worker
-
-        worker.moveToThread(thread)
-
-        thread.started.connect(worker.run)
-        worker.finished.connect(self.errors_added)
-        worker.progress.connect(self.add_error)
-        worker.finished.connect(thread.quit)
-        worker.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
-
-        thread.start()
-    
-    @Slot(dict)
-    def add_error(self, addon_data):
-        self.errors_layout.addWidget(AddonRow(addon_data))
-    
-    def errors_added(self):
-        # self.status_label.setText("Task completed!")
-        # self.start_button.setEnabled(True)
-        self.errors_layout.addStretch()
-        
-    def setup_installed_tab(self):
-        scroll = AddonScroll()
-        self.installed_addons_ready = False
-
-        self.stacked_widget.addWidget(scroll)
-        self.addons_layout = scroll.get_layout()
-        
-    def setup_errors_tab(self):
-        scroll = AddonScroll()
-
-        self.stacked_widget.addWidget(scroll)
-        self.errors_layout = scroll.get_layout()
-        
-    def setup_search_tab(self):
-        tab = QWidget()
-        layout = QVBoxLayout(tab)
-        label = QLabel("Search Tab Content")
-        label.setStyleSheet("color: white;")
-        layout.addWidget(label)
-        self.stacked_widget.addWidget(tab)
+    # def setup_search_tab(self):
+    #     tab = QWidget()
+    #     layout = QVBoxLayout(tab)
+    #     label = QLabel("Search Tab Content")
+    #     label.setStyleSheet("color: white;")
+    #     layout.addWidget(label)
+    #     self.stacked_widget.addWidget(tab)
         
     def setup_options_tab(self):
         tab = QWidget()
@@ -346,26 +491,17 @@ class Main(QMainWindow):
         label.setStyleSheet("color: white;")
         layout.addWidget(label)
         self.stacked_widget.addWidget(tab)
-        
-    def setup_connections(self):
-        self.btn_installed.clicked.connect(lambda: self.switch_tab(1))
-        self.btn_errors.clicked.connect(lambda: self.switch_tab(2))
-        self.btn_search.clicked.connect(lambda: self.switch_tab(3))
-        self.btn_options.clicked.connect(lambda: self.switch_tab(4))
-        
-        self.btn_installed.setChecked(True)
-        self.switch_tab(0)
-        
+    
     def switch_tab(self, index):
-        if index == 1 and self.installed_addons_ready:
-            self.stacked_widget.setCurrentIndex(index)
-        else:
-            self.stacked_widget.setCurrentIndex(0)
+        if not (0 <= index < len(self.__tabs)):
+            return
+        
+        self.__buttons[index].setChecked(True)
 
-        # Update button states
-        # buttons = [self.btn_installed, self.btn_errors, self.btn_search, self.btn_options]
-        # for i, btn in enumerate(buttons):
-        #     btn.setChecked(i == index)
+        if self.__tabs[index].is_loaded:
+            self.stacked_widget.setCurrentWidget(self.__tabs[index])
+        else:
+            self.show_loading(index)
 
 
 if __name__ == "__main__":
